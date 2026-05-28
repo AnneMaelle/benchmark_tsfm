@@ -1,30 +1,31 @@
-"""MIT-BIH Arrhythmia Database — event detection (1-D segmentation).
+"""MIT-BIH Arrhythmia Database — 1-D event detection.
 
 Each record is a 2-channel ECG sampled at 360 Hz.  Beat annotations are
-converted to per-sample integer class labels using the 5-class AAMI grouping:
+converted to an object-detection style target using the 5-class AAMI grouping:
 
-    0  background (between beats)
-    1  N  — Normal / bundle-branch-block / paced
-    2  S  — Supraventricular ectopic
-    3  V  — Ventricular ectopic
-    4  F  — Fusion
-    5  Q  — Unknown / pacemaker artefact
-
-Each annotated R-peak is expanded by ±beat_window samples; samples outside
-any window are labelled 0 (background).
+    class 0  N  — Normal / bundle-branch-block / paced
+    class 1  S  — Supraventricular ectopic
+    class 2  V  — Ventricular ectopic
+    class 3  F  — Fusion
+    class 4  Q  — Unknown / pacemaker artefact
 
 Data contract output
 --------------------
-X_train : List[np.ndarray (T_i, 2)]   training portions  (C == 2)
-y_train : List[np.ndarray (T_i,)]     int labels 0–5
-X_test  : List[np.ndarray (T_j, 2)]   test portions
-y_test  : List[np.ndarray (T_j,)]     int labels 0–5
+X_train : List[np.ndarray (T_i, 2)]      training portions  (C == 2)
+y_train : List[np.ndarray (N_i, 2+K)]   one row per beat event:
+                                            col 0    start  (normalised, 0–1)
+                                            col 1    width  (normalised, 0–1)
+                                            cols 2…  one-hot class vector (K)
+X_test  : List[np.ndarray (T_j, 2)]      test portions
+y_test  : List[np.ndarray (N_j, 2+K)]   same format
 task    : "event_detection"
-metrics : ["segment_f1", "iou_segment"]
+metrics : ["map_iou"]
+extra   : n_classes (int)  K above
 """
 
 import numpy as np
 from benchopt import BaseDataset
+from benchmark_utils.download import fetch_mitdb
 
 
 # AAMI beat-type grouping (MIT-BIH annotation symbol → class index)
@@ -62,31 +63,61 @@ def _load_record(record_id, data_dir):
 
     Returns
     -------
-    signal : np.ndarray (T, 2)  float32
-    labels : np.ndarray (T,)    int32  per-sample class 0–5
+    signal     : np.ndarray (T, 2)   float32
+    ann_samples: np.ndarray (A,)     int32   R-peak sample indices
+    ann_symbols: list of str         length A annotation symbols
     """
-    raise NotImplementedError
+    import wfdb
+
+    path = str(data_dir / record_id)
+    record = wfdb.rdrecord(path)
+    ann = wfdb.rdann(path, "atr")
+
+    signal = record.p_signal.astype(np.float32)
+    return signal, ann.sample, ann.symbol
 
 
-def _make_label_array(n_samples, ann_samples, ann_symbols, beat_window):
-    """Convert beat annotations to a per-sample label array.
+def _annotations_to_events(n_samples, ann_samples, ann_symbols, beat_window,
+                           n_classes):
+    """Convert beat annotations to an object-detection target array.
 
     Parameters
     ----------
-    n_samples    : int
+    n_samples    : int                   total length of the series
     ann_samples  : np.ndarray (A,) int   sample indices of each annotation
     ann_symbols  : list of str           annotation symbols (len A)
-    beat_window  : int                   half-width of label window in samples
+    beat_window  : int                   half-width of each event in samples
+    n_classes    : int                   K — number of AAMI classes
 
     Returns
     -------
-    labels : np.ndarray (n_samples,) int32
+    events : np.ndarray (N, 2+K)  float32
+        Each row: [start_norm, width_norm, *one_hot_class]
+        Only beats whose symbol appears in BEAT_CLASS are included.
     """
-    raise NotImplementedError
+    rows = []
+    for sample, symbol in zip(ann_samples, ann_symbols):
+        aami_class = BEAT_CLASS.get(symbol)
+        if aami_class is None:
+            continue
+        # Collapse to single class when n_classes == 1
+        class_idx = 0 if n_classes == 1 else aami_class - 1
+        if class_idx >= n_classes:
+            continue
+
+        start = max(0, sample - beat_window)
+        end = min(n_samples, sample + beat_window)
+        one_hot = np.zeros(n_classes, dtype=np.float32)
+        one_hot[class_idx] = 1.0
+        rows.append([start / n_samples, (end - start) / n_samples, *one_hot])
+
+    if not rows:
+        return np.zeros((0, 2 + n_classes), dtype=np.float32)
+    return np.array(rows, dtype=np.float32)
 
 
 class Dataset(BaseDataset):
-    """MIT-BIH Arrhythmia Database for event detection.
+    """MIT-BIH Arrhythmia Database for 1-D event detection.
 
     Parameters
     ----------
@@ -97,8 +128,12 @@ class Dataset(BaseDataset):
     train_ratio : float
         Fraction of each record used as training data.
     beat_window : int
-        Half-width (in samples) of the label window around each R-peak.
+        Half-width (in samples) of each event box around the R-peak.
         Default 36 ≈ ±100 ms at 360 Hz (covers the QRS complex).
+    n_classes : int
+        K — number of AAMI beat classes to distinguish (1–5).
+        Classes are ordered N, S, V, F, Q; setting n_classes=1 collapses all
+        annotated beats into a single "beat" class.
     """
 
     name = "MITDB"
@@ -110,11 +145,10 @@ class Dataset(BaseDataset):
         "debug": [False],
         "train_ratio": [0.7],
         "beat_window": [36],
+        "n_classes": [5],
     }
 
     def get_data(self):
-        from benchmark_utils.download import fetch_mitdb
-
         data_dir = fetch_mitdb()
 
         record_ids = MITDB_RECORDS if self.record_ids == "all" else self.record_ids
@@ -123,18 +157,28 @@ class Dataset(BaseDataset):
 
         X_train, y_train, X_test, y_test = [], [], [], []
         for rid in record_ids:
-            signal, labels = _load_record(rid, data_dir)
+            signal, ann_samples, ann_symbols = _load_record(rid, data_dir)
 
             if self.debug:
+                mask = ann_samples < 5000
+                ann_samples = ann_samples[mask]
+                ann_symbols = [s for s, m in zip(ann_symbols, mask) if m]
                 signal = signal[:5000]
-                labels = labels[:5000]
 
             split = max(1, int(len(signal) * self.train_ratio))
 
-            X_train.append(signal[:split])
-            y_train.append(labels[:split])
-            X_test.append(signal[split:])
-            y_test.append(labels[split:])
+            for seg_signal, start, end, Xl, yl in [
+                (signal[:split],  0,     split,       X_train, y_train),
+                (signal[split:],  split, len(signal), X_test,  y_test),
+            ]:
+                seg_ann = ann_samples[(ann_samples >= start) & (ann_samples < end)] - start
+                seg_sym = [s for s, idx in zip(ann_symbols, ann_samples)
+                           if start <= idx < end]
+                Xl.append(seg_signal)
+                yl.append(_annotations_to_events(
+                    len(seg_signal), seg_ann, seg_sym,
+                    self.beat_window, self.n_classes,
+                ))
 
         return dict(
             X_train=X_train,
@@ -142,5 +186,6 @@ class Dataset(BaseDataset):
             X_test=X_test,
             y_test=y_test,
             task="event_detection",
-            metrics=["segment_f1", "iou_segment"],
+            metrics=["map_iou"],
+            n_classes=self.n_classes,
         )

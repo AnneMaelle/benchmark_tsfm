@@ -1,6 +1,7 @@
 """Shared download helper for the TSB-UAD public dataset bundle.
 """
 from pathlib import Path
+import pooch
 
 from benchopt import config
 
@@ -64,8 +65,6 @@ def fetch_tsb_uad(name: str) -> Path:
             f"{name!r} is not a TSB-UAD dataset name. "
             f"Known names: {sorted(_SUBDIR)}"
         )
-
-    import pooch  # local import: only required when downloading
 
     try:
         import tqdm  # noqa: F401

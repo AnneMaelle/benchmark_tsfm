@@ -280,7 +280,7 @@ class Solver(BaseTSFMSolver):
         if task == "event_detection":
             self._n_classes = int(meta["n_classes"])
             self._d_model = _CHRONOS_D.get(self.model_size, 512)
-            self._Z_train = precompute_embeddings(self.model, X_train)
+            self._Z_train = precompute_embeddings(self.model, X_train, batch_size=self.batch_size)
 
     def forecast_batch(self, inputs):
         """Chronos-specific batch prediction.

@@ -241,7 +241,7 @@ class EventHead(nn.Module):
 
             # --- class loss: matched → GT class, unmatched → zero target -------
             cls_target = torch.zeros_like(cls_logits_b)    # (N, k) all zeros
-            cls_target[pred_idx] = gt_cls[gt_idx]          # matched slots get real labels
+            cls_target[pred_idx] = gt_cls[gt_idx].to(cls_target.dtype)
             cls_loss_b = nn.functional.binary_cross_entropy_with_logits(
                 cls_logits_b, cls_target, reduction="mean"
             )
@@ -354,7 +354,7 @@ def _get_linear_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def precompute_embeddings(pipeline, X_train):
+def precompute_embeddings(pipeline, X_train, batch_size=128):
     """Embed every training series via a frozen Chronos pipeline.
 
     Each series is embedded channel-by-channel and the per-channel
@@ -367,23 +367,43 @@ def precompute_embeddings(pipeline, X_train):
         A loaded (and frozen) Chronos pipeline exposing ``.embed()``.
     X_train : List[np.ndarray (T, C)]
         Training time series.
+    batch_size : int
+        Number of series to embed in a single ``pipeline.embed()`` call.
+        Each channel is treated as a separate univariate series, so the
+        actual call size is ``batch_size * C``.
 
     Returns
     -------
     List[torch.Tensor]  — one (T_tok, D) float32 CPU tensor per series.
     """
     Z_train = []
+    n = len(X_train)
     with torch.no_grad():
-        for x in X_train:
-            x = np.asarray(x, dtype=np.float32)
-            C = x.shape[1]
-            channel_embs = []
-            for c in range(C):
-                ctx = torch.tensor(x[:, c], dtype=torch.float32)
-                emb, _ = pipeline.embed(ctx.unsqueeze(0))  # (1, T_tok, D)
-                channel_embs.append(emb.squeeze(0).float().cpu())
-            stacked = torch.stack(channel_embs, dim=0)  # (C, T_tok, D)
-            Z_train.append(stacked.mean(dim=0))          # (T_tok, D)
+        for start in range(0, n, batch_size):
+            batch = X_train[start:start + batch_size]
+            # Flatten all channels across the batch into one list of 1D tensors.
+            # Order: x0c0, x0c1, ..., x1c0, x1c1, ...
+            contexts = []
+            channel_counts = []
+            for x in batch:
+                x = np.asarray(x, dtype=np.float32)
+                C = x.shape[1]
+                channel_counts.append(C)
+                for c in range(C):
+                    contexts.append(torch.tensor(x[:, c], dtype=torch.float32))
+
+            embs, _ = pipeline.embed(contexts)  # (sum(C_i), T_tok, D)
+            embs = embs.float().cpu()
+
+            idx = 0
+            for C in channel_counts:
+                channel_embs = embs[idx:idx + C]        # (C, T_tok, D)
+                Z_train.append(channel_embs.mean(dim=0)) # (T_tok, D)
+                idx += C
+
+            print(f"  Embedded {min(start + batch_size, n)}/{n} series", end="\r")
+
+    print()
     return Z_train
 
 
@@ -478,8 +498,8 @@ def fit_event_head(
     scheduler = _get_linear_cosine_scheduler(optimizer, warmup_epochs, num_epochs)
 
     N_train = len(Z_train)
-    use_amp = device == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_amp = "cuda" in device
+    scaler = torch.amp.GradScaler(device, enabled=use_amp)
 
     for epoch in range(num_epochs):
         indices = np.random.permutation(N_train)

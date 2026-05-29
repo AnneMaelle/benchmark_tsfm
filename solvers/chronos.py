@@ -278,6 +278,7 @@ class Solver(BaseSolver):
         # fall back to float32 there so inference doesn't crash or stall.
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
         model_id = self.model_path if self.model_path else f"amazon/chronos-t5-{self.model_size}"
         if not hasattr(self, "_pipeline") or self._loaded_model != model_id:
             self._pipeline = ChronosPipeline.from_pretrained(

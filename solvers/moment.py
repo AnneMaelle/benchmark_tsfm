@@ -62,7 +62,7 @@ class _MomentForecaster(BaseTSFMAdapter):
             preds_per_series = []
             for cutoff in cutoffs:
                 hist = series[:cutoff]  # (T_cutoff, C)
-                
+
                 if hist.ndim == 1:
                     hist = hist[None, :]
 
@@ -105,12 +105,12 @@ class _MomentForecaster(BaseTSFMAdapter):
                     )
 
                 preds_per_series.append(arr)
-            
+
             # Stack predictions: (n_cutoffs, prediction_length, C)
             stacked = np.stack(preds_per_series, axis=0)
             # Add quantile dimension: (n_cutoffs, 1, prediction_length, C)
             quantiles.append(stacked[:, None, :, :])
-        
+
         return ForecastOutput(quantiles=quantiles, quantile_levels=(0.5,))
 
 
@@ -122,7 +122,7 @@ class _MomentEncoder(UnpooledEncoder):
 
     def encode(self, X) -> np.ndarray:
         """Extract embeddings from time series data.
-        
+
         Args:
             X: np.ndarray of shape (T, C) or (B, T, C)
 
@@ -174,7 +174,6 @@ class Solver(BaseSolver):
         "pip::moment @ git+https://github.com/moment-timeseries-foundation-model/moment.git",
     ]
 
-
     sampling_strategy = "run_once"
 
     parameters = {
@@ -182,17 +181,11 @@ class Solver(BaseSolver):
         "task_config": ["forecasting"],  # forecasting or classification
         "pooler": ["mean"],  # pooler for classification embeddings
         "batch_size": [32],
-<<<<<<< HEAD
-        "classifier": ["logistic_regression"],
-        "max_iter": [1000],
-        "n_estimators": [100],
-=======
         "classifier": ["log_reg"],
         "penalty": ["l2"],
         "C": [1.0],
         "alpha": [1.0],
         "n_iterators": [100],
->>>>>>> c573cd85c2b80ced694b62bda534833d5461cee5
     }
 
     def skip(self, task, **kwargs):

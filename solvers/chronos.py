@@ -11,6 +11,10 @@ every (series, cutoff) pair into a single ``Chronos2Pipeline.predict``
 call — the pipeline accepts a list of variable-length tensors and
 applies left-padding internally, so all the per-cutoff work happens in
 one forward pass.
+
+References
+----------
+    https://github.com/amazon-science/chronos-forecasting
 """
 
 import numpy as np
@@ -54,6 +58,68 @@ def _to_context(x):
     if x.ndim == 2:
         x = x[None]
     return x.transpose(0, 2, 1)
+
+
+class _ChronosForecaster(BaseTSFMAdapter):
+    """Batched Chronos v1 adapter; quantiles are derived from sample draws."""
+
+    DEFAULT_QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+    def __init__(self, pipeline, prediction_length, quantile_levels=None):
+        self.pipeline = pipeline
+        self.prediction_length = prediction_length
+        self.quantile_levels = quantile_levels or self.DEFAULT_QUANTILE_LEVELS
+
+    def predict(self, x: ForecastInput) -> ForecastOutput:
+        inputs, layout, per_series_shape = self._build_inputs(x)
+        if not inputs:
+            return ForecastOutput(quantiles=[], quantile_levels=self.quantile_levels)
+
+        with torch.no_grad():
+            output = self.pipeline.predict(
+                inputs,
+                prediction_length=self.prediction_length,
+            )
+        return self._assemble_output(output, layout, per_series_shape)
+
+    def _build_inputs(self, x):
+        """Build list of 1-D tensors (one per channel) and track layout."""
+        inputs = []
+        layout = []  # (series_idx, cutoff_idx, channel_idx)
+        per_series_shape = []  # (C, n_cutoffs)
+        for series_idx, (series, cutoffs) in enumerate(zip(x.x, x.cutoff_indexes)):
+            series = np.asarray(series, dtype=np.float32)
+            if series.ndim == 1:
+                series = series[:, None]
+            _, C = series.shape
+            per_series_shape.append((C, len(cutoffs)))
+            for cutoff_idx, cutoff in enumerate(cutoffs):
+                hist = series[:cutoff]
+                for c in range(C):
+                    inputs.append(torch.from_numpy(hist[:, c]))
+                    layout.append((series_idx, cutoff_idx, c))
+        return inputs, layout, per_series_shape
+
+    def _assemble_output(self, samples, layout, per_series_shape):
+        """Derive quantile fan from Monte-Carlo sample draws."""
+        # samples: (n_inputs, num_samples, H)
+        q_arr = np.quantile(
+            samples.float().cpu().numpy(),
+            q=list(self.quantile_levels),
+            axis=1,
+        ).transpose(1, 0, 2)  # (n_inputs, Q, H)
+
+        Q = len(self.quantile_levels)
+        per_series = [
+            np.empty((n_cutoffs, Q, self.prediction_length, C), dtype=np.float32)
+            for C, n_cutoffs in per_series_shape
+        ]
+        for i, (series_idx, cutoff_idx, c) in enumerate(layout):
+            per_series[series_idx][cutoff_idx, :, :, c] = q_arr[i]
+
+        return ForecastOutput(
+            quantiles=per_series, quantile_levels=self.quantile_levels
+        )
 
 
 class _ChronosEmbedEncoder(UnpooledEncoder):
@@ -116,8 +182,17 @@ class _ChronosHookEncoder(UnpooledEncoder):
         finally:
             handle.remove()
 
-        # (C, T_tok, D) -> (T_tok, C, D)
-        return captured["h"].transpose(0, 1).float().cpu().numpy()
+        # (B*V, T_tok, D) -> (B, T_tok, V, D) matching _ChronosEmbedEncoder output shape
+        B, V = context.shape[:2]
+        D = captured["h"].shape[-1]
+        return (
+            captured["h"]
+            .reshape(B, V, -1, D)
+            .permute(0, 2, 1, 3)
+            .float()
+            .cpu()
+            .numpy()
+        )
 
 
 def ChronosEncoder(pipeline, layer: int | None = None) -> UnpooledEncoder:

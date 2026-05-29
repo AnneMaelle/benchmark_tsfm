@@ -254,6 +254,100 @@ def map_iou(y_true, y_pred, iou_threshold=0.5):
     return float(np.mean(valid)) if valid else float("nan")
 
 
+def _collect_tp_pairs(gt_by_series, preds, iou_threshold):
+    """Greedy IoU matching. Returns list of ([s,w]_pred, [s,w]_gt) for each TP."""
+    matched = {i: [False] * len(boxes) for i, boxes in gt_by_series.items()}
+    pairs = []
+    for i, s, w, _ in preds:
+        best_iou, best_gi = 0.0, -1
+        for gi, (gs, gw) in enumerate(gt_by_series.get(i, [])):
+            iou = _iou_1d(s, w, gs, gw)
+            if iou > best_iou:
+                best_iou, best_gi = iou, gi
+        if best_iou >= iou_threshold and best_gi >= 0 and not matched[i][best_gi]:
+            gs, gw = gt_by_series[i][best_gi]
+            pairs.append(([s, w], [gs, gw]))
+            matched[i][best_gi] = True
+    return pairs
+
+
+def _match_events(gt_by_series, preds, iou_threshold):
+    """Greedy IoU matching (highest-score first). Returns (tp, fp, fn)."""
+    matched = {i: [False] * len(boxes) for i, boxes in gt_by_series.items()}
+    n_gt = sum(len(b) for b in gt_by_series.values())
+    tp = fp = 0
+    for i, s, w, _ in preds:
+        best_iou, best_gi = 0.0, -1
+        for gi, (gs, gw) in enumerate(gt_by_series.get(i, [])):
+            iou = _iou_1d(s, w, gs, gw)
+            if iou > best_iou:
+                best_iou, best_gi = iou, gi
+        if best_iou >= iou_threshold and best_gi >= 0 and not matched[i][best_gi]:
+            tp += 1
+            matched[i][best_gi] = True
+        else:
+            fp += 1
+    return tp, fp, n_gt - tp
+
+
+def f1_det(y_true, y_pred, iou_threshold=0.5, score_threshold=None):
+    """Macro F1 for event detection.
+
+    Parameters
+    ----------
+    y_true, y_pred : same format as map_iou
+    iou_threshold  : minimum IoU to count a match (default 0.5)
+    score_threshold: fixed class score threshold; if None, sweep to maximise F1
+                     per class (oracle — for benchmarking purposes only)
+    """
+    if not y_true:
+        return float("nan")
+
+    n_classes = y_true[0].shape[1] - 2
+    f1s = []
+
+    for k in range(n_classes):
+        gt_by_series = {}
+        n_gt = 0
+        for i, gt in enumerate(y_true):
+            boxes = [(row[0], row[1]) for row in gt
+                     if len(gt) > 0 and np.argmax(row[2:]) == k]
+            gt_by_series[i] = boxes
+            n_gt += len(boxes)
+
+        if n_gt == 0:
+            f1s.append(float("nan"))
+            continue
+
+        all_preds = []
+        for i, pred in enumerate(y_pred):
+            for row in pred:
+                all_preds.append((i, row[0], row[1], float(row[2 + k])))
+        all_preds.sort(key=lambda x: -x[3])
+
+        if score_threshold is None:
+            scores = np.array([p[3] for p in all_preds])
+            thresholds = (
+                np.percentile(scores, np.arange(0, 100, 1))
+                if len(scores) else [0.5]
+            )
+            best_f1 = 0.0
+            for thr in thresholds:
+                preds = [p for p in all_preds if p[3] >= thr]
+                tp, fp, fn = _match_events(gt_by_series, preds, iou_threshold)
+                denom = 2 * tp + fp + fn
+                best_f1 = max(best_f1, (2 * tp / denom) if denom > 0 else 0.0)
+            f1s.append(best_f1)
+        else:
+            preds = [p for p in all_preds if p[3] >= score_threshold]
+            tp, fp, fn = _match_events(gt_by_series, preds, iou_threshold)
+            denom = 2 * tp + fp + fn
+            f1s.append((2 * tp / denom) if denom > 0 else 0.0)
+
+    valid = [f for f in f1s if not np.isnan(f)]
+    return float(np.mean(valid)) if valid else float("nan")
+
+
 # ---------------------------------------------------------------------------
 # Registry: maps metric name → function
 # ---------------------------------------------------------------------------
@@ -280,6 +374,7 @@ AD_METRICS = {
 
 EVENT_METRICS = {
     "map_iou": map_iou,
+    "f1_det": f1_det,
 }
 
 ALL_METRICS = {**FORECASTING_METRICS, **CLASSIFICATION_METRICS, **AD_METRICS,

@@ -12,12 +12,14 @@ converted to an object-detection style target using the 5-class AAMI grouping:
 Data contract output
 --------------------
 X_train : List[np.ndarray (T_i, 2)]      training portions  (C == 2)
-y_train : List[np.ndarray (N_i, 2+K)]   one row per beat event:
+y_train : List[np.ndarray (N, 2+K)]     one row per beat event, zero-padded
+                                            to N = max events across all segments:
                                             col 0    start  (normalised, 0–1)
                                             col 1    width  (normalised, 0–1)
                                             cols 2…  one-hot class vector (K)
+                                            all-zero row = empty/padding slot
 X_test  : List[np.ndarray (T_j, 2)]      test portions
-y_test  : List[np.ndarray (N_j, 2+K)]   same format
+y_test  : List[np.ndarray (N, 2+K)]     same format, same N
 task    : "event_detection"
 metrics : ["map_iou"]
 extra   : n_classes (int)  K above
@@ -180,11 +182,27 @@ class Dataset(BaseDataset):
                     self.beat_window, self.n_classes,
                 ))
 
+        # Pad all event arrays to a uniform N so solvers can np.stack them.
+        # N = max events in any single segment across train and test.
+        all_y = y_train + y_test
+        max_n = max((y.shape[0] for y in all_y), default=0)
+        n_cols = 2 + self.n_classes
+
+        def _pad(arrays):
+            out = []
+            for y in arrays:
+                n = y.shape[0]
+                if n < max_n:
+                    pad = np.zeros((max_n - n, n_cols), dtype=np.float32)
+                    y = np.concatenate([y, pad], axis=0)
+                out.append(y)
+            return out
+
         return dict(
             X_train=X_train,
-            y_train=y_train,
+            y_train=_pad(y_train),
             X_test=X_test,
-            y_test=y_test,
+            y_test=_pad(y_test),
             task="event_detection",
             metrics=["map_iou"],
             n_classes=self.n_classes,

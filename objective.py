@@ -35,8 +35,9 @@ classification     y_train  (N,) int
                    extra    n_classes (int)
 anomaly_detection  y_train  None
                    y_test   List[(T_j,)] int  point-level binary labels
-event_detection    y_train  List[(N, 2+K)] float  object-detection boxes
-                   y_test   List[(N, 2+K)] float  object-detection boxes
+event_detection    y_train  List[(N, 2+K)] float  object-detection boxes,
+                                                  zero-padded to uniform N
+                   y_test   List[(N, 2+K)] float  same format, same N
                    extra    n_classes (int), T (int, default 512)
 
                    Each row of the (N, 2+k) array is one event slot:

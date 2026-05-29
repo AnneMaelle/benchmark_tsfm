@@ -266,6 +266,11 @@ class Solver(BaseTSFMSolver):
         "num_dec_layers": [2],
         "lambda_cls": [1.0],
         "num_queries": [10],
+        "classifier": ["log_reg"],
+        "penalty": ["l2"],
+        "C": [1.0],
+        "alpha": [1.0],
+        "n_iterators": [100],
     }
 
     def __init__(
